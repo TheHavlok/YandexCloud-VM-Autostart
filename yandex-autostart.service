@@ -1,0 +1,26 @@
+[Unit]
+Description=Yandex Cloud VM Autostart Service
+After=network.target
+
+[Service]
+# User to run the service as. Change this if running as a specific user.
+# User=root
+# Group=root
+
+# Path to the python script
+# IMPORTANT: Update /path/to/main.py to the actual location on your Linux server
+ExecStart=/usr/bin/python3 /opt/yandex-vm-autostart/main.py
+
+# Restart the service automatically if it crashes
+Restart=always
+RestartSec=10
+
+# Environment variables (if needed)
+# Environment=PYTHONUNBUFFERED=1
+
+# Output logging
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

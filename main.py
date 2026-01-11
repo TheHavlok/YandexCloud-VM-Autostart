@@ -1,34 +1,32 @@
 #!/usr/bin/env python3
-import requests
 import time
 import sys
 import argparse
 import os
+import json
+import logging
+import requests
 from datetime import datetime
 
 # =====================
-# GLOBAL CONFIG
+# CONFIGURATION
 # =====================
-INSTANCE_ID = "your-instance-id-here"
-IAM_TOKEN = "your-iam-token-here"
-CHECK_INTERVAL = 60
-CREDENTIALS_FILE = os.path.expanduser("~/.yc_autostart_credentials")
+APP_NAME = "yandex-autostart"
+CONFIG_DIR = os.path.expanduser(f"~/.config/{APP_NAME}")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
 
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+logger = logging.getLogger(APP_NAME)
 
 # =====================
-# TERMINAL COLORS
+# ANSII COLORS
 # =====================
 USE_COLOR = sys.stdout.isatty()
 
 def c(code): return f"\033[{code}m" if USE_COLOR else ""
-
-GREEN = c("32")
-RED = c("31")
-YELLOW = c("33")
-BLUE = c("34")
-GRAY = c("90")
-BOLD = c("1")
-RESET = c("0")
+GREEN, RED, YELLOW, BLUE, GRAY, BOLD, RESET = c("32"), c("31"), c("33"), c("34"), c("90"), c("1"), c("0")
 
 def ok(t): return f"{GREEN}{t}{RESET}"
 def warn(t): return f"{YELLOW}{t}{RESET}"
@@ -36,248 +34,232 @@ def err(t): return f"{RED}{t}{RESET}"
 def info(t): return f"{BLUE}{t}{RESET}"
 def dim(t): return f"{GRAY}{t}{RESET}"
 
-def log(msg):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{dim(ts)} {msg}")
-
-
 # =====================
-# CREDENTIALS HANDLING
+# API CLIENT
 # =====================
-def load_credentials():
-    global INSTANCE_ID, IAM_TOKEN
-    if os.path.exists(CREDENTIALS_FILE):
+class YandexCloudClient:
+    def __init__(self, oauth_token=None, iam_token=None):
+        self.oauth_token = oauth_token
+        self.iam_token = iam_token
+        self.iam_expires_at = 0
+
+    def refresh_iam_token(self):
+        """Exchanges OAuth token for IAM token."""
+        if not self.oauth_token:
+            raise ValueError("OAuth token is required to refresh IAM token")
+        
+        logger.debug("Refreshing IAM token...")
         try:
-            with open(CREDENTIALS_FILE, "r") as f:
-                for line in f:
-                    if line.startswith("INSTANCE_ID="):
-                        INSTANCE_ID = line.strip().split("=", 1)[1].strip().strip('"')
-                    elif line.startswith("IAM_TOKEN="):
-                        IAM_TOKEN = line.strip().split("=", 1)[1].strip().strip('"')
-            log(ok(f"Credentials loaded from {CREDENTIALS_FILE}"))
+            r = requests.post(
+                "https://iam.api.cloud.yandex.net/iam/v1/tokens",
+                json={"yandexPassportOauthToken": self.oauth_token},
+                timeout=10
+            )
+            r.raise_for_status()
+            data = r.json()
+            self.iam_token = data["iamToken"]
+            # IAM tokens live 12h, let's refresh slightly earlier to be safe
+            # But here we just set it. The caller can handle timing or we can lazy-load.
+            logger.info("IAM token refreshed successfully")
         except Exception as e:
-            log(err(f"Failed to load credentials: {e}"))
-    else:
-        log(warn(f"No credentials file found, using globals"))
+            logger.error(f"Failed to refresh IAM token: {e}")
+            raise
 
+    def build_headers(self):
+        if not self.iam_token:
+            self.refresh_iam_token()
+        return {"Authorization": f"Bearer {self.iam_token}"}
 
-def save_credentials(instance_id, iam_token):
+    def _request(self, method, url, **kwargs):
+        """Wrapper to handle 401 Unauthorized by refreshing token."""
+        headers = kwargs.pop("headers", {})
+        headers.update(self.build_headers())
+        
+        try:
+            r = requests.request(method, url, headers=headers, **kwargs)
+            if r.status_code == 401 and self.oauth_token:
+                logger.warning("Token expired (401), refreshing...")
+                self.refresh_iam_token()
+                headers["Authorization"] = f"Bearer {self.iam_token}"
+                r = requests.request(method, url, headers=headers, **kwargs)
+            return r
+        except requests.RequestException as e:
+            logger.error(f"Network error: {e}")
+            raise
+
+    def get_clouds(self):
+        r = self._request("GET", "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/clouds")
+        r.raise_for_status()
+        return r.json().get("clouds", [])
+
+    def get_folders(self, cloud_id):
+        r = self._request("GET", "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/folders", params={"cloudId": cloud_id})
+        r.raise_for_status()
+        return r.json().get("folders", [])
+
+    def get_instances(self, folder_id):
+        r = self._request("GET", "https://compute.api.cloud.yandex.net/compute/v1/instances", params={"folderId": folder_id})
+        r.raise_for_status()
+        return r.json().get("instances", [])
+
+    def get_instance(self, instance_id):
+        r = self._request("GET", f"https://compute.api.cloud.yandex.net/compute/v1/instances/{instance_id}")
+        r.raise_for_status()
+        return r.json()
+
+    def start_instance(self, instance_id):
+        r = self._request("POST", f"https://compute.api.cloud.yandex.net/compute/v1/instances/{instance_id}:start")
+        if r.status_code in (200, 202):
+            logger.info(f"Start command sent for {instance_id}")
+            return True
+        else:
+            logger.error(f"Failed to start instance {instance_id}: Status {r.status_code} - {r.text}")
+            return False
+
+# =====================
+# CONFIG MANAGER
+# =====================
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return None
     try:
-        with open(CREDENTIALS_FILE, "w") as f:
-            f.write(f'INSTANCE_ID="{instance_id}"\n')
-            f.write(f'IAM_TOKEN="{iam_token}"\n')
-        log(ok(f"Credentials saved to {CREDENTIALS_FILE}"))
+        with open(CONFIG_FILE, 'r') as f:
+            return json.load(f)
     except Exception as e:
-        log(err(f"Failed to save credentials: {e}"))
+        logger.error(f"Failed to load config: {e}")
+        return None
 
-
-# =====================
-# API
-# =====================
-def exchange_oauth_to_iam(oauth):
-    r = requests.post(
-        "https://iam.api.cloud.yandex.net/iam/v1/tokens",
-        json={"yandexPassportOauthToken": oauth},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json()["iamToken"]
-
-
-def get_clouds(iam):
-    r = requests.get(
-        "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/clouds",
-        headers={"Authorization": f"Bearer {iam}"},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json().get("clouds", [])
-
-
-def get_folders(iam, cloud_id):
-    r = requests.get(
-        "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/folders",
-        headers={"Authorization": f"Bearer {iam}"},
-        params={"cloudId": cloud_id},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json().get("folders", [])
-
-
-def get_instances(iam, folder_id):
-    r = requests.get(
-        "https://compute.api.cloud.yandex.net/compute/v1/instances",
-        headers={"Authorization": f"Bearer {iam}"},
-        params={"folderId": folder_id},
-        timeout=10,
-    )
-    r.raise_for_status()
-    return r.json().get("instances", [])
-
+def save_config(config):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info(f"Config saved to {CONFIG_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to save config: {e}")
 
 # =====================
-# SELECT HELPERS
+# INTERACTIVE SETUP
 # =====================
-def select_items(items, label):
+def select_item(items, label):
     if not items:
-        raise RuntimeError(f"No {label} found")
-
-    if len(items) == 1:
-        return items  # один — берем сразу
-
-    print()
-    print(BOLD + f"Available {label}:" + RESET)
+        print(warn(f"No {label} found"))
+        return None
+    
+    print(f"\n{BOLD}Available {label}:{RESET}")
     for i, item in enumerate(items, 1):
-        print(f" {i}) {item['name']}  {ok(item['id'])}")
+        print(f" {i}) {item['name']} {dim(item['id'])}")
+    
+    while True:
+        choice = input(f"\nSelect {label} (1-{len(items)}) [1]: ").strip()
+        if not choice:
+            return items[0]
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(items):
+                return items[idx]
+        print(err("Invalid selection"))
 
-    choice = input(
-        f"\nSelect {label} number or press Enter for ALL [default: all]: "
-    ).strip()
-
-    if choice == "" or choice == "0":
-        return items
-
-    idx = int(choice) - 1
-    return [items[idx]]
-
-
-# =====================
-# GETMYINFO
-# =====================
-def get_my_info():
-    print()
-    print(BOLD + "Yandex Cloud authorization required" + RESET)
-    print(ok("https://yandex.cloud/ru/docs/iam/concepts/authorization/oauth-token"))
-    print()
-
-    oauth = input("Paste OAuth token: ").strip()
+def run_setup():
+    print(f"\n{BOLD}=== Yandex Cloud Autostart Setup ==={RESET}")
+    print(info("This wizard will help you configure the autostart service."))
+    print(info(f"Configuration will be saved to: {CONFIG_FILE}"))
+    print(info("You need an OAuth token from Yandex: https://yandex.cloud/ru/docs/iam/concepts/authorization/oauth-token\n"))
+    
+    oauth = input("Enter OAuth Token: ").strip()
     if not oauth:
-        print(err("OAuth token is empty"))
-        sys.exit(1)
-
-    log(info("Exchanging OAuth → IAM"))
-    iam = exchange_oauth_to_iam(oauth)
-    log(ok("IAM token received"))
-
-    clouds = select_items(get_clouds(iam), "Clouds")
-    all_instances = []
-
-    for cloud in clouds:
-        log(info(f"Processing Cloud {cloud['name']}"))
-        folders = select_items(get_folders(iam, cloud["id"]), "Folders")
-
-        for folder in folders:
-            log(info(f"Fetching instances from folder {folder['name']}"))
-            instances = get_instances(iam, folder["id"])
-            for inst in instances:
-                inst["_cloud"] = cloud["name"]
-                inst["_folder"] = folder["name"]
-            all_instances.extend(instances)
-
-    # вывод Available instances
-    print()
-    print(BOLD + "Available instances:" + RESET)
-    for inst in all_instances:
-        pre = inst.get("schedulingPolicy", {}).get("preemptible", False)
-        pflag = ok("YES") if pre else warn("NO")
-        print(inst["name"])
-        print(f"  ID:           {ok(inst['id'])}")
-        print(f"  Preemptible:  {pflag}")
-        print(f"  Cloud:        {inst['_cloud']}")
-        print(f"  Folder:       {inst['_folder']}")
-        print()
-
-    # CONFIGURATION SUMMARY
-    print("=" * 72)
-    print(BOLD + "CONFIGURATION SUMMARY" + RESET)
-    print("=" * 72)
-    print(f"IAM_TOKEN = {ok(iam)}")
-    print()
-    print(BOLD + "Available instances:" + RESET)
-    for inst in all_instances:
-        print(inst["name"])
-        print(f"  ID:           {ok(inst['id'])}")
-        print()
-
-    # предложение сохранить в файл
-    save = input("Do you want to save IAM_TOKEN and INSTANCE_ID to file for future runs? [y/N]: ").strip().lower()
-    if save == "y":
-        # если несколько VM, выбрать одну
-        if all_instances:
-            if len(all_instances) == 1:
-                selected_instance = all_instances[0]
-            else:
-                print("\nSelect INSTANCE_ID to save:")
-                for i, inst in enumerate(all_instances, 1):
-                    print(f" {i}) {inst['name']}  {ok(inst['id'])}")
-                choice = input("Select number [default 1]: ").strip()
-                idx = int(choice) - 1 if choice else 0
-                selected_instance = all_instances[idx]
-            save_credentials(selected_instance["id"], iam)
-
-
-# =====================
-# RUNTIME
-# =====================
-def start_instance(iid, iam):
-    r = requests.post(
-        f"https://compute.api.cloud.yandex.net/compute/v1/instances/{iid}:start",
-        headers={"Authorization": f"Bearer {iam}"},
-        timeout=10,
-    )
-    if r.status_code in (200, 202):
-        log(ok("Start command sent"))
-    else:
-        log(err(f"Start failed: {r.status_code}"))
-
-
-def check_instance_status(iid, iam):
-    r = requests.get(
-        f"https://compute.api.cloud.yandex.net/compute/v1/instances/{iid}",
-        headers={"Authorization": f"Bearer {iam}"},
-        timeout=10,
-    )
-    if r.status_code != 200:
-        log(err(f"HTTP {r.status_code}"))
+        print(err("OAuth token is required!"))
         return
 
-    data = r.json()
-    status = data["status"]
-    name = data["name"]
+    client = YandexCloudClient(oauth_token=oauth)
+    
+    try:
+        client.refresh_iam_token()
+        print(ok("✓ Authentication successful"))
+    except Exception:
+        print(err("✗ Authentication failed. Check your token."))
+        return
 
-    if status == "RUNNING":
-        log(f"{name}: {ok(status)}")
-    elif status == "STOPPED":
-        log(f"{name}: {warn(status)} → starting")
-        start_instance(iid, iam)
-    else:
-        log(f"{name}: {info(status)}")
+    print("Fetching Clouds...")
+    clouds = client.get_clouds()
+    cloud = select_item(clouds, "Cloud")
+    if not cloud: return
 
+    print(f"Fetching Folders in '{cloud['name']}'...")
+    folders = client.get_folders(cloud['id'])
+    folder = select_item(folders, "Folder")
+    if not folder: return
+
+    print(f"Fetching Instances in '{folder['name']}'...")
+    instances = client.get_instances(folder['id'])
+    instance = select_item(instances, "Instance")
+    if not instance: return
+
+    config = {
+        "oauth_token": oauth,
+        "instance_id": instance['id'],
+        "instance_name": instance['name'],
+        "check_interval": 60
+    }
+    
+    save_config(config)
+    print(ok("\n✓ Configuration setup complete!"))
+    print(info(f"Now you can run the script normally or install the systemd service."))
 
 # =====================
-# MAIN
+# MAIN LOOP
 # =====================
+def run_loop(config):
+    oauth = config.get("oauth_token")
+    instance_id = config.get("instance_id")
+    interval = config.get("check_interval", 60)
+    
+    if not oauth or not instance_id:
+        logger.error("Invalid config: missing oauth_token or instance_id")
+        sys.exit(1)
+
+    client = YandexCloudClient(oauth_token=oauth)
+    
+    logger.info(f"Starting monitor for Instance ID: {instance_id}")
+    logger.info(f"Check Interval: {interval}s")
+
+    while True:
+        try:
+            inst = client.get_instance(instance_id)
+            name = inst.get("name", "Unknown")
+            status = inst.get("status", "UNKNOWN")
+            
+            if status == "RUNNING":
+                logger.info(f"{name}: {ok('RUNNING')}")
+            elif status == "STOPPED":
+                logger.warning(f"{name}: {warn('STOPPED')} -> Starting...")
+                client.start_instance(instance_id)
+            else:
+                logger.info(f"{name}: {dim(status)}")
+                
+        except Exception as e:
+            logger.error(f"Error checking instance: {e}")
+        
+        time.sleep(interval)
+
 def main():
-    load_credentials()
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--getmyinfo", action="store_true")
+    parser = argparse.ArgumentParser(description="Yandex Cloud VM Autostart")
+    parser.add_argument("--setup", action="store_true", help="Run interactive setup")
     args = parser.parse_args()
 
-    if args.getmyinfo:
-        get_my_info()
+    if args.setup:
+        run_setup()
         return
 
-    if INSTANCE_ID.startswith("your-") or IAM_TOKEN.startswith("your-"):
-        print(err("INSTANCE_ID and IAM_TOKEN must be set"))
-        sys.exit(1)
+    config = load_config()
+    if not config:
+        print(warn("Configuration not found."))
+        run_setup()
+        config = load_config()
+        if not config:
+            return
 
-    log(f"Monitoring {ok(INSTANCE_ID)}")
-    while True:
-        check_instance_status(INSTANCE_ID, IAM_TOKEN)
-        time.sleep(CHECK_INTERVAL)
-
+    run_loop(config)
 
 if __name__ == "__main__":
     main()

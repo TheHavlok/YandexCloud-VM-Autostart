@@ -1,197 +1,201 @@
 # =====================
+# Yandex Cloud VM Autostart (PowerShell)
+# =====================
+
+# Configuration Paths (Shared with Python version)
+$ConfigDir = "$HOME/.config/yandex-autostart"
+$ConfigFile = "$ConfigDir/config.json"
+
+# =====================
+# LOGGING
+# =====================
+function Log-Info($msg) { 
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "$ts [INFO] $msg" -ForegroundColor Cyan 
+}
+function Log-Ok($msg) { 
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "$ts [OK] $msg" -ForegroundColor Green 
+}
+function Log-Warn($msg) { 
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "$ts [WARN] $msg" -ForegroundColor Yellow 
+}
+function Log-Err($msg) { 
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-Host "$ts [ERROR] $msg" -ForegroundColor Red 
+}
+
+# =====================
 # CONFIGURATION
 # =====================
-$CREDENTIALS_FILE = "$HOME\.yc_autostart_credentials"
-$CHECK_INTERVAL = 60
-
-# Defaults
-$INSTANCE_ID = "your-instance-id-here"
-$IAM_TOKEN = "your-iam-token-here"
-
-# =====================
-# COLORS
-# =====================
-function Write-OK($text){ Write-Host $text -ForegroundColor Green }
-function Write-WARN($text){ Write-Host $text -ForegroundColor Yellow }
-function Write-ERR($text){ Write-Host $text -ForegroundColor Red }
-function Write-INFO($text){ Write-Host $text -ForegroundColor Cyan }
-function Write-DIM($text){ Write-Host $text -ForegroundColor DarkGray }
-
-function Log($msg){
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    Write-DIM "$ts $msg"
-}
-
-# =====================
-# CREDENTIALS
-# =====================
-function Load-Credentials {
-    if (Test-Path $CREDENTIALS_FILE) {
-        Get-Content $CREDENTIALS_FILE | ForEach-Object {
-            if ($_ -match '^INSTANCE_ID="(.+)"') { $global:INSTANCE_ID = $matches[1] }
-            if ($_ -match '^IAM_TOKEN="(.+)"') { $global:IAM_TOKEN = $matches[1] }
+function Get-Config {
+    if (Test-Path $ConfigFile) {
+        try {
+            return Get-Content -Raw $ConfigFile | ConvertFrom-Json
+        } catch {
+            Log-Err "Failed to parse config file."
+            return $null
         }
-        Log "Credentials loaded from $CREDENTIALS_FILE"
-    } else {
-        Log "No credentials file found, using globals"
+    }
+    return $null
+}
+
+function Save-Config($configObj) {
+    if (-not (Test-Path $ConfigDir)) { New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null }
+    $configObj | ConvertTo-Json -Depth 5 | Set-Content $ConfigFile
+    Log-Ok "Config saved to $ConfigFile"
+}
+
+# =====================
+# API CLIENT
+# =====================
+$Global:IAM_TOKEN = $null
+$Global:OAUTH_TOKEN = $null
+
+function Get-IamToken {
+    if (-not $Global:OAUTH_TOKEN) { Log-Err "No OAuth token available"; throw "NoOAuth" }
+    
+    Log-Info "Refreshing IAM Token..."
+    try {
+        $body = @{ yandexPassportOauthToken = $Global:OAUTH_TOKEN } | ConvertTo-Json
+        $resp = Invoke-RestMethod -Method Post -Uri "https://iam.api.cloud.yandex.net/iam/v1/tokens" -Body $body -ContentType "application/json"
+        $Global:IAM_TOKEN = $resp.iamToken
+        Log-Ok "IAM Token refreshed"
+    } catch {
+        Log-Err "Failed to refresh IAM token: $($_.Exception.Message)"
+        throw
     }
 }
 
-function Save-Credentials {
-    @"
-INSTANCE_ID="$INSTANCE_ID"
-IAM_TOKEN="$IAM_TOKEN"
-"@ | Set-Content $CREDENTIALS_FILE
-    Log "Credentials saved to $CREDENTIALS_FILE"
-}
+function Invoke-YandexApi {
+    param($Method="Get", $Uri, $Body=$null)
+    
+    if (-not $Global:IAM_TOKEN) { Get-IamToken }
 
-# =====================
-# API FUNCTIONS
-# =====================
-function Exchange-OAuthToIAM($oauth){
-    $body = @{ yandexPassportOauthToken = $oauth } | ConvertTo-Json
-    $resp = Invoke-RestMethod -Method Post -Uri "https://iam.api.cloud.yandex.net/iam/v1/tokens" -Body $body -ContentType "application/json"
-    $global:IAM_TOKEN = $resp.iamToken
-}
+    $headers = @{ Authorization = "Bearer $Global:IAM_TOKEN" }
+    if ($Body) { $headers["Content-Type"] = "application/json" }
 
-function Get-Clouds { 
-    Invoke-RestMethod -Uri "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/clouds" -Headers @{ Authorization = "Bearer $IAM_TOKEN" } | Select-Object -ExpandProperty clouds
-}
-
-function Get-Folders($cloudId){ 
-    Invoke-RestMethod -Uri "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/folders?cloudId=$cloudId" -Headers @{ Authorization = "Bearer $IAM_TOKEN" } | Select-Object -ExpandProperty folders
-}
-
-function Get-Instances($folderId){ 
-    Invoke-RestMethod -Uri "https://compute.api.cloud.yandex.net/compute/v1/instances?folderId=$folderId" -Headers @{ Authorization = "Bearer $IAM_TOKEN" } | Select-Object -ExpandProperty instances
-}
-
-# =====================
-# SELECT HELPERS
-# =====================
-function Select-ItemInteractive($items, $label){
-    if ($items.Count -eq 1) { return $items }
-    Write-Host "`nAvailable $label:"
-    for ($i=0; $i -lt $items.Count; $i++){
-        $item = $items[$i]
-        Write-Host " $($i+1)) $($item.name) " -NoNewline; Write-OK $item.id
-    }
-    $choice = Read-Host "`nSelect number or press Enter for ALL [default: all]"
-    if (-not $choice -or $choice -eq 0) { return $items }
-    return @($items[$choice-1])
-}
-
-# =====================
-# GETMYINFO
-# =====================
-function Get-MyInfo {
-    Write-Host "`nYandex Cloud authorization required"
-    Write-OK "https://yandex.cloud/ru/docs/iam/concepts/authorization/oauth-token"
-    $oauth = Read-Host "Paste OAuth token"
-    if (-not $oauth) { Write-ERR "OAuth token is empty"; exit 1 }
-
-    Log "Exchanging OAuth → IAM"
-    Exchange-OAuthToIAM $oauth
-    Write-OK "IAM token received"
-
-    $clouds = Select-ItemInteractive (Get-Clouds) "Clouds"
-    $allInstances = @()
-    foreach ($cloud in $clouds){
-        Log "Processing Cloud $($cloud.name)"
-        $folders = Select-ItemInteractive (Get-Folders $cloud.id) "Folders"
-        foreach ($folder in $folders){
-            Log "Fetching instances from folder $($folder.name)"
-            $instances = Get-Instances $folder.id
-            foreach ($inst in $instances){
-                $inst | Add-Member -NotePropertyName Cloud -NotePropertyValue $cloud.name
-                $inst | Add-Member -NotePropertyName Folder -NotePropertyValue $folder.name
+    try {
+        return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $Body
+    } catch {
+        # Check for 401 Unauthorized
+        if ($_.Exception.Response.StatusCode.value__ -eq 401) {
+            Log-Warn "Token expired (401), refreshing..."
+            try {
+                Get-IamToken
+                $headers["Authorization"] = "Bearer $Global:IAM_TOKEN"
+                return Invoke-RestMethod -Method $Method -Uri $Uri -Headers $headers -Body $Body
+            } catch {
+                Log-Err "Retry failed: $($_.Exception.Message)"
+                throw
             }
-            $allInstances += $instances
-        }
-    }
-
-    # Show available instances
-    Write-Host "`nAvailable instances:"
-    foreach ($inst in $allInstances){
-        $pre = $inst.schedulingPolicy.preemptible
-        $pflag = if ($pre) { Write-OK "YES" } else { Write-WARN "NO" }
-        Write-Host $inst.name
-        Write-Host "  ID:           $($inst.id)"
-        Write-Host "  Preemptible:  $pflag"
-        Write-Host "  Cloud:        $($inst.Cloud)"
-        Write-Host "  Folder:       $($inst.Folder)"
-        Write-Host ""
-    }
-
-    Write-Host "================================================================"
-    Write-Host "CONFIGURATION SUMMARY"
-    Write-Host "IAM_TOKEN = $IAM_TOKEN"
-    Write-Host "Available instances:"
-    foreach ($inst in $allInstances){
-        Write-Host $inst.name
-        Write-Host "  ID:           $($inst.id)"
-    }
-
-    $save = Read-Host "Do you want to save IAM_TOKEN and INSTANCE_ID to file for future runs? [y/N]"
-    if ($save -match '^[Yy]$'){
-        if ($allInstances.Count -eq 1){
-            $global:INSTANCE_ID = $allInstances[0].id
         } else {
-            Write-Host "`nSelect INSTANCE_ID to save:"
-            for ($i=0; $i -lt $allInstances.Count; $i++){
-                Write-Host " $($i+1)) $($allInstances[$i].name) " -NoNewline; Write-OK $($allInstances[$i].id)
-            }
-            $choice = Read-Host "Select number [default 1]"
-            $choice = if ($choice) { $choice-1 } else { 0 }
-            $global:INSTANCE_ID = $allInstances[$choice].id
+            throw
         }
-        Save-Credentials
     }
 }
 
 # =====================
-# MONITORING
+# ACTIONS
 # =====================
-function Start-Instance {
-    $url = "https://compute.api.cloud.yandex.net/compute/v1/instances/$INSTANCE_ID:start"
-    $resp = Invoke-RestMethod -Method Post -Uri $url -Headers @{ Authorization = "Bearer $IAM_TOKEN"; "Content-Type" = "application/json" }
-    Log "Start command sent"
+function Check-And-Start($instanceId) {
+    try {
+        $inst = Invoke-YandexApi -Uri "https://compute.api.cloud.yandex.net/compute/v1/instances/$instanceId"
+        $name = $inst.name
+        $status = $inst.status
+
+        if ($status -eq "RUNNING") {
+            Log-Ok "$name is RUNNING"
+        } elseif ($status -eq "STOPPED") {
+            Log-Warn "$name is STOPPED -> Starting..."
+            Invoke-YandexApi -Method Post -Uri "https://compute.api.cloud.yandex.net/compute/v1/instances/$instanceId:start" | Out-Null
+            Log-Info "Start command sent"
+        } else {
+            Log-Info "$name status: $status"
+        }
+    } catch {
+        Log-Err "Error checking instance: $($_.Exception.Message)"
+    }
 }
 
-function Check-InstanceStatus {
-    $url = "https://compute.api.cloud.yandex.net/compute/v1/instances/$INSTANCE_ID"
-    $resp = Invoke-RestMethod -Uri $url -Headers @{ Authorization = "Bearer $IAM_TOKEN" }
-    $status = $resp.status
-    $name = $resp.name
-    Write-Host "Instance: $name (ID: $INSTANCE_ID)"
-    Write-Host "Status: $status"
-    if ($status -eq "RUNNING"){ Write-OK "✓ Instance is RUNNING" }
-    elseif ($status -eq "STOPPED"){ Write-WARN "⚠ Instance is STOPPED → starting"; Start-Instance }
-    else { Write-INFO "⏳ Instance status: $status" }
-    Write-Host "------------------------------------------------------------"
+# =====================
+# SETUP WIZARD
+# =====================
+function Run-Setup {
+    Write-Host "`n=== Yandex Cloud Autostart Setup (PowerShell) ===" -ForegroundColor Cyan
+    Write-Host "Obtain OAuth token here: https://yandex.cloud/ru/docs/iam/concepts/authorization/oauth-token`n"
+    
+    $oauth = Read-Host "Enter OAuth Token"
+    $Global:OAUTH_TOKEN = $oauth.Trim()
+
+    try {
+        Get-IamToken
+    } catch {
+        Log-Err "Authentication failed."
+        exit
+    }
+
+    # Pick Cloud
+    $clouds = (Invoke-YandexApi -Uri "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/clouds").clouds
+    Write-Host "`nAvailable Clouds:"
+    for ($i=0; $i -lt $clouds.Count; $i++) { Write-Host " $($i+1)) $($clouds[$i].name)" }
+    $cIdx = [int](Read-Host "Select Cloud [1]") - 1
+    if ($cIdx -lt 0) { $cIdx = 0 }
+    $cloudId = $clouds[$cIdx].id
+
+    # Pick Folder
+    $folders = (Invoke-YandexApi -Uri "https://resource-manager.api.cloud.yandex.net/resource-manager/v1/folders?cloudId=$cloudId").folders
+    Write-Host "`nAvailable Folders:"
+    for ($i=0; $i -lt $folders.Count; $i++) { Write-Host " $($i+1)) $($folders[$i].name)" }
+    $fIdx = [int](Read-Host "Select Folder [1]") - 1
+    if ($fIdx -lt 0) { $fIdx = 0 }
+    $folderId = $folders[$fIdx].id
+
+    # Pick Instance
+    $instances = (Invoke-YandexApi -Uri "https://compute.api.cloud.yandex.net/compute/v1/instances?folderId=$folderId").instances
+    if (-not $instances) { Log-Err "No instances found in folder"; exit }
+    Write-Host "`nAvailable Instances:"
+    for ($i=0; $i -lt $instances.Count; $i++) { Write-Host " $($i+1)) $($instances[$i].name) ($($instances[$i].id))" }
+    $iIdx = [int](Read-Host "Select Instance [1]") - 1
+    if ($iIdx -lt 0) { $iIdx = 0 }
+    $instance = $instances[$iIdx]
+
+    $config = @{
+        oauth_token = $Global:OAUTH_TOKEN
+        instance_id = $instance.id
+        instance_name = $instance.name
+        check_interval = 60
+    }
+    Save-Config $config
+    Log-Ok "Setup complete. Run script again to start monitoring."
 }
 
 # =====================
 # MAIN
 # =====================
-param([switch]$getmyinfo)
+param([switch]$Setup)
 
-Load-Credentials
+if ($Setup) {
+    Run-Setup
+    exit
+}
 
-if ($getmyinfo){ Get-MyInfo; exit }
+$config = Get-Config
+if (-not $config) {
+    Log-Warn "Configuration not found. Starting setup..."
+    Run-Setup
+    $config = Get-Config
+}
 
-if ($INSTANCE_ID -like "your-*" -or $IAM_TOKEN -like "your-*"){ Write-ERR "INSTANCE_ID and IAM_TOKEN must be set or saved in $CREDENTIALS_FILE"; exit 1 }
+$Global:OAUTH_TOKEN = $config.oauth_token
+$instanceId = $config.instance_id
+$interval = if ($config.check_interval) { $config.check_interval } else { 60 }
 
-Write-Host "Starting instance status monitoring with auto-start..."
-Write-Host "Instance ID: $INSTANCE_ID"
-Write-Host "Check interval: $CHECK_INTERVAL seconds"
-Write-Host "============================================================"
+Log-Info "Starting Monitor for $($config.instance_name) ($instanceId)"
+Log-Info "Interval: $interval seconds"
 
-try{
-    while ($true){
-        Check-InstanceStatus
-        Start-Sleep -Seconds $CHECK_INTERVAL
-    }
-} catch [System.Management.Automation.StopUpstreamCommandsException] {
-    Write-WARN "Monitoring stopped by user"
+while ($true) {
+    Check-And-Start $instanceId
+    Start-Sleep -Seconds $interval
 }
